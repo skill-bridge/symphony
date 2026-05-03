@@ -1,7 +1,8 @@
 defmodule SymphonyElixir.GitHub.ClientTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.GitHub.{Client, Issue}
+  alias SymphonyElixir.GitHub.Client
+  alias SymphonyElixir.Linear.Issue
 
   describe "normalise_issue/2" do
     test "maps GitHub REST issue payload to Issue struct" do
@@ -31,9 +32,6 @@ defmodule SymphonyElixir.GitHub.ClientTest do
                state: "open",
                url: "https://github.com/skill-bridge/skillbridge-ai-platform/issues/1234",
                assignee_id: "genki1234",
-               node_id: "I_kwDOABC",
-               number: 1234,
-               repo: "skill-bridge/skillbridge-ai-platform",
                labels: ["symphony", "bug", "priority/2"],
                priority: 2,
                assigned_to_worker: true,

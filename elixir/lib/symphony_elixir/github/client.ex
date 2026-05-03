@@ -23,7 +23,7 @@ defmodule SymphonyElixir.GitHub.Client do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, GitHub.Issue}
+  alias SymphonyElixir.{Config, Linear.Issue}
 
   @page_size 50
   @max_error_body_log_bytes 1_000
@@ -342,10 +342,14 @@ defmodule SymphonyElixir.GitHub.Client do
   # --- normalisation --------------------------------------------------------
 
   @spec normalise_issue(map(), String.t() | nil) :: Issue.t()
-  def normalise_issue(payload, repo_full_name) when is_map(payload) do
+  def normalise_issue(payload, _repo_full_name) when is_map(payload) do
     number = payload["number"]
     labels = extract_labels(payload["labels"])
 
+    # The orchestrator pattern-matches on `%Linear.Issue{}` everywhere, so the
+    # GitHub adapter populates that same struct. The owner/repo pair is
+    # available at write time via `Config.settings!().tracker.repo`, and the
+    # numeric id alone is sufficient to address GitHub PATCH/POST endpoints.
     %Issue{
       id: number_to_id(number),
       identifier: number_to_identifier(number),
@@ -356,9 +360,6 @@ defmodule SymphonyElixir.GitHub.Client do
       branch_name: nil,
       url: payload["html_url"],
       assignee_id: assignee_login(payload),
-      node_id: payload["node_id"],
-      number: number,
-      repo: repo_full_name,
       labels: labels,
       blocked_by: [],
       assigned_to_worker: true,
