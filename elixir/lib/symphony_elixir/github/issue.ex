@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.GitHub.Issue do
-  @moduledoc """
+  @moduledoc ~S"""
   Normalised GitHub issue representation, mirrored on the Linear schema so the
   orchestrator can treat both backends uniformly.
 
@@ -8,14 +8,14 @@ defmodule SymphonyElixir.GitHub.Issue do
     * `id` is the issue **number** as a string (`"123"`). GitHub's PATCH/POST
       endpoints take `(owner, repo, number)`; the repo comes from runtime
       config, so storing the number alone is sufficient.
-    * `identifier` is `"#{number}"` (display-friendly) so workspace keys
-      sanitise to `_<number>`.
+    * `identifier` is `"#" <> number` (display-friendly, e.g. `#1234`) so
+      workspace keys sanitise to `_<number>`.
     * `state` is the GitHub native state — `"open"` or `"closed"` — which
       lines up cleanly with `active_states: ["open"]` / `terminal_states:
       ["closed"]` in the workflow.
-    * `branch_name` is left `nil`. The agent prompt is expected to ask Claude
-      to create a `claude-refactor/<asset>-<ts>` branch in line with the
-      Skill Bridge convention.
+    * `branch_name` is left `nil`. The agent prompt is expected to ask
+      Claude to create a `claude-refactor/<asset>-<ts>` branch in line
+      with the Skill Bridge convention.
   """
 
   defstruct [
