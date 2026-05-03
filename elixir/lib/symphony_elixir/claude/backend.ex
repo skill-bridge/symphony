@@ -315,9 +315,6 @@ defmodule SymphonyElixir.Claude.Backend do
 
       {:result, %{status: :failed} = result} ->
         result
-
-      :ignore ->
-        acc
     end
   end
 

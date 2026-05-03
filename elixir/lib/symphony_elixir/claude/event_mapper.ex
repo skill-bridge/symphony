@@ -22,7 +22,6 @@ defmodule SymphonyElixir.Claude.EventMapper do
           {:emit, atom(), map()}
           | {:init, map()}
           | {:result, map()}
-          | :ignore
 
   @spec map_event(map()) :: emitted()
   def map_event(%{"type" => "system", "subtype" => "init"} = msg) do
