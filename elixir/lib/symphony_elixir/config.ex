@@ -119,7 +119,7 @@ defmodule SymphonyElixir.Config do
       is_nil(settings.tracker.kind) ->
         {:error, :missing_tracker_kind}
 
-      settings.tracker.kind not in ["linear", "memory"] ->
+      settings.tracker.kind not in ["linear", "memory", "github"] ->
         {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
 
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
@@ -128,10 +128,25 @@ defmodule SymphonyElixir.Config do
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
         {:error, :missing_linear_project_slug}
 
+      settings.tracker.kind == "github" and not is_binary(settings.tracker.api_key) ->
+        {:error, :missing_github_api_token}
+
+      settings.tracker.kind == "github" and not valid_github_repo?(settings.tracker.repo) ->
+        {:error, :missing_or_invalid_github_repo}
+
       true ->
         :ok
     end
   end
+
+  defp valid_github_repo?(repo) when is_binary(repo) do
+    case String.split(String.trim(repo), "/", parts: 2) do
+      [owner, name] when owner != "" and name != "" -> true
+      _ -> false
+    end
+  end
+
+  defp valid_github_repo?(_), do: false
 
   defp format_config_error(reason) do
     case reason do

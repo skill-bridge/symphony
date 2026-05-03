@@ -50,6 +50,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      # GitHub adapter only: "owner/repo" + optional label gate.
+      field(:repo, :string)
+      field(:required_labels, {:array, :string}, default: [])
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
@@ -59,7 +62,17 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :assignee,
+          :repo,
+          :required_labels,
+          :active_states,
+          :terminal_states
+        ],
         empty_values: []
       )
     end
@@ -404,9 +417,17 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp finalize_settings(settings) do
+    tracker_kind = settings.tracker.kind
+
+    api_key_fallback =
+      case tracker_kind do
+        "github" -> System.get_env("GITHUB_TOKEN")
+        _ -> System.get_env("LINEAR_API_KEY")
+      end
+
     tracker = %{
       settings.tracker
-      | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
+      | api_key: resolve_secret_setting(settings.tracker.api_key, api_key_fallback),
         assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
     }
 
