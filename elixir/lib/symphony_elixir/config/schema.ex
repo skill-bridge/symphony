@@ -425,10 +425,24 @@ defmodule SymphonyElixir.Config.Schema do
         _ -> System.get_env("LINEAR_API_KEY")
       end
 
+    # The schema defaults `endpoint` to the Linear GraphQL host (preserved for
+    # backward compatibility with existing workflows). For GitHub-backed
+    # trackers swap that out for the REST root unless the operator overrode
+    # the value explicitly — otherwise the GitHub client would happily POST to
+    # api.linear.app.
+    resolved_endpoint =
+      case {tracker_kind, settings.tracker.endpoint} do
+        {"github", "https://api.linear.app/graphql"} -> "https://api.github.com"
+        {"github", nil} -> "https://api.github.com"
+        {"github", ""} -> "https://api.github.com"
+        {_, value} -> value
+      end
+
     tracker = %{
       settings.tracker
       | api_key: resolve_secret_setting(settings.tracker.api_key, api_key_fallback),
-        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE")),
+        endpoint: resolved_endpoint
     }
 
     workspace = %{
