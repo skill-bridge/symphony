@@ -22,9 +22,18 @@ defmodule SymphonyElixir.Claude.Backend do
   require Logger
 
   alias SymphonyElixir.{Config, PathSafety, SSH}
-  alias SymphonyElixir.Claude.{EventMapper, StreamJson}
+  alias SymphonyElixir.Claude.{EventMapper, StreamJson, ToolTracker}
 
   @session_state_key :__symphony_claude_session_state__
+
+  # Cap accumulated parser buffer (a single, never-newline-terminated line)
+  # at 10 MiB. A single tool_result that big is almost certainly pathological,
+  # so we drop the partial line to protect the BEAM binary heap.
+  @max_buffer_bytes 10 * 1024 * 1024
+
+  # Read at most this many trailing bytes of the stderr capture file when
+  # surfacing it on a failed turn. Keeps logs/messages bounded.
+  @stderr_tail_max_bytes 8_192
 
   @typedoc """
   Per-session opaque struct returned by `start_session/2`. The Codex backend
@@ -36,25 +45,34 @@ defmodule SymphonyElixir.Claude.Backend do
           workspace: Path.t(),
           worker_host: String.t() | nil,
           metadata: map(),
-          command: [String.t()]
+          command: [String.t()],
+          is_continuation: boolean()
         }
 
   @impl true
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    resume_thread_id = Keyword.get(opts, :resume_thread_id)
+    is_continuation = is_binary(resume_thread_id)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, command} <- resolve_command() do
-      thread_id = Keyword.get(opts, :thread_id) || gen_uuid()
+      thread_id = resume_thread_id || Keyword.get(opts, :thread_id) || gen_uuid()
       reset_turn_counter(thread_id)
 
       session = %{
         thread_id: thread_id,
         workspace: expanded_workspace,
         worker_host: worker_host,
-        metadata: %{thread_id: thread_id, worker_host: worker_host},
-        command: command
+        metadata: %{
+          thread_id: thread_id,
+          worker_host: worker_host,
+          is_continuation: is_continuation,
+          requested_thread_id: thread_id
+        },
+        command: command,
+        is_continuation: is_continuation
       }
 
       {:ok, session}
@@ -75,7 +93,7 @@ defmodule SymphonyElixir.Claude.Backend do
     )
 
     case open_claude_port(session, prompt, turn_number) do
-      {:ok, port} ->
+      {:ok, port, stderr_path} ->
         emit_message(
           on_message,
           :session_started,
@@ -83,7 +101,7 @@ defmodule SymphonyElixir.Claude.Backend do
           session.metadata
         )
 
-        case stream_turn(port, on_message, session.metadata, session_id) do
+        case stream_turn(port, on_message, session.metadata, session_id, stderr_path) do
           {:ok, result} ->
             emit_message(
               on_message,
@@ -131,6 +149,7 @@ defmodule SymphonyElixir.Claude.Backend do
   @spec stop_session(session()) :: :ok
   def stop_session(%{thread_id: thread_id}) do
     clear_turn_counter(thread_id)
+    ToolTracker.clear()
     :ok
   end
 
@@ -145,8 +164,17 @@ defmodule SymphonyElixir.Claude.Backend do
 
       true ->
         with {:ok, prompt_path} <- write_prompt_tempfile(prompt) do
+          stderr_path = stderr_tempfile_path()
+
           command_line =
-            build_command_line(session.command, session.thread_id, turn_number, prompt_path)
+            session.command
+            |> build_command_line(
+              session.thread_id,
+              turn_number,
+              prompt_path,
+              session.is_continuation
+            )
+            |> wrap_with_stderr_capture(stderr_path)
 
           try do
             port =
@@ -155,18 +183,21 @@ defmodule SymphonyElixir.Claude.Backend do
                 [
                   :binary,
                   :exit_status,
-                  :stderr_to_stdout,
                   :hide,
                   :use_stdio,
                   {:cd, String.to_charlist(session.workspace)},
-                  {:args, ["-lc", command_line]}
+                  # `set -m` enables job control so the shell becomes a process
+                  # group leader; the spawned `claude` (and its node children)
+                  # share that pgid, which we kill on timeout.
+                  {:args, ["-c", "set -m; " <> command_line]}
                 ]
               )
 
-            {:ok, port}
+            {:ok, port, stderr_path}
           rescue
             error ->
               File.rm(prompt_path)
+              cleanup_stderr(stderr_path)
               {:error, {:port_open_failed, Exception.message(error)}}
           end
         end
@@ -177,12 +208,20 @@ defmodule SymphonyElixir.Claude.Backend do
        when is_binary(worker_host) do
     with {:ok, remote_prompt_path} <- write_remote_prompt_file(worker_host, prompt) do
       command_line =
-        build_command_line(session.command, session.thread_id, turn_number, remote_prompt_path)
+        build_command_line(
+          session.command,
+          session.thread_id,
+          turn_number,
+          remote_prompt_path,
+          session.is_continuation
+        )
 
       remote = "cd #{shell_escape(session.workspace)} && #{command_line}"
 
       case SSH.start_port(worker_host, remote) do
-        {:ok, port} -> {:ok, port}
+        # Remote runs do not have a local stderr capture file; pass nil so the
+        # downstream `read_stderr_tail/1` becomes a no-op.
+        {:ok, port} -> {:ok, port, nil}
         {:error, _} = err -> err
       end
     end
@@ -219,9 +258,26 @@ defmodule SymphonyElixir.Claude.Backend do
     end
   end
 
-  defp build_command_line(command_words, thread_id, turn_number, prompt_path)
+  defp stderr_tempfile_path do
+    Path.join(
+      System.tmp_dir!(),
+      "symphony-claude-stderr-#{:erlang.unique_integer([:positive])}.log"
+    )
+  end
+
+  # Wrap the user-visible command so stderr is teed to a file we can read on
+  # failure, while stdout is forwarded untouched to the BEAM port. Doing this
+  # in bash (rather than `:stderr_to_stdout`) keeps the NDJSON stream clean of
+  # `[SandboxDebug]` lines and node warnings.
+  defp wrap_with_stderr_capture(command_line, stderr_path) do
+    "{ " <> command_line <> "; } 2> " <> shell_escape(stderr_path)
+  end
+
+  defp build_command_line(command_words, thread_id, turn_number, prompt_path, is_continuation)
        when is_list(command_words) do
-    base = Enum.map(command_words, &shell_escape/1) |> Enum.join(" ")
+    base = command_words |> Enum.map(&shell_escape/1) |> Enum.join(" ")
+
+    flag = if turn_number > 1 or is_continuation, do: "--resume", else: "--session-id"
 
     extra =
       [
@@ -230,7 +286,7 @@ defmodule SymphonyElixir.Claude.Backend do
         "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
-        if(turn_number == 1, do: "--session-id", else: "--resume"),
+        flag,
         thread_id
       ]
       |> Enum.map(&shell_escape/1)
@@ -248,39 +304,162 @@ defmodule SymphonyElixir.Claude.Backend do
 
   # --- stream loop ----------------------------------------------------------
 
-  defp stream_turn(port, on_message, metadata, session_id) do
-    do_stream_turn(port, StreamJson.new(), on_message, metadata, session_id, nil)
+  defp stream_turn(port, on_message, metadata, session_id, stderr_path) do
+    turn_started_at = System.monotonic_time(:millisecond)
+
+    do_stream_turn(
+      port,
+      StreamJson.new(),
+      on_message,
+      metadata,
+      session_id,
+      nil,
+      turn_started_at,
+      stderr_path
+    )
   end
 
-  defp do_stream_turn(port, parser, on_message, metadata, session_id, last_result) do
+  defp do_stream_turn(
+         port,
+         parser,
+         on_message,
+         metadata,
+         session_id,
+         last_result,
+         turn_started_at,
+         stderr_path
+       ) do
     receive do
       {^port, {:data, chunk}} when is_binary(chunk) ->
-        handle_chunk(port, parser, on_message, metadata, session_id, last_result, chunk)
+        handle_chunk(
+          port,
+          parser,
+          on_message,
+          metadata,
+          session_id,
+          last_result,
+          chunk,
+          turn_started_at,
+          stderr_path
+        )
 
       {^port, {:exit_status, 0}} ->
-        finalise(parser, on_message, metadata, session_id, last_result, :exit_normal)
+        finalise(parser, on_message, metadata, session_id, last_result, :exit_normal, stderr_path)
 
       {^port, {:exit_status, status}} ->
-        finalise(parser, on_message, metadata, session_id, last_result, {:exit_nonzero, status})
+        finalise(
+          parser,
+          on_message,
+          metadata,
+          session_id,
+          last_result,
+          {:exit_nonzero, status},
+          stderr_path
+        )
     after
-      turn_timeout_ms() ->
-        safe_close(port)
-        {:error, {:turn_timeout, turn_timeout_ms()}}
+      stall_timeout_ms() ->
+        elapsed = System.monotonic_time(:millisecond) - turn_started_at
+        total = turn_timeout_ms()
+
+        cond do
+          elapsed > total ->
+            safe_close(port)
+            stderr_tail = read_stderr_tail(stderr_path)
+            cleanup_stderr(stderr_path)
+            {:error, {:turn_timeout, total, stderr_tail}}
+
+          stall_timeout_ms() == 0 ->
+            # stall detection disabled — fall through to receive again.
+            do_stream_turn(
+              port,
+              parser,
+              on_message,
+              metadata,
+              session_id,
+              last_result,
+              turn_started_at,
+              stderr_path
+            )
+
+          true ->
+            emit_message(
+              on_message,
+              :stall_detected,
+              %{
+                session_id: session_id,
+                since_last_chunk_ms: stall_timeout_ms(),
+                elapsed_ms: elapsed
+              },
+              metadata
+            )
+
+            do_stream_turn(
+              port,
+              parser,
+              on_message,
+              metadata,
+              session_id,
+              last_result,
+              turn_started_at,
+              stderr_path
+            )
+        end
     end
   end
 
-  defp handle_chunk(port, parser, on_message, metadata, session_id, last_result, chunk) do
+  defp handle_chunk(
+         port,
+         parser,
+         on_message,
+         metadata,
+         session_id,
+         last_result,
+         chunk,
+         turn_started_at,
+         stderr_path
+       ) do
     {:ok, events, parser} = StreamJson.feed(parser, chunk)
+
+    parser = enforce_buffer_cap(parser, on_message, metadata, session_id)
 
     last_result =
       Enum.reduce(events, last_result, fn event, acc ->
         process_event(event, on_message, metadata, session_id, acc)
       end)
 
-    do_stream_turn(port, parser, on_message, metadata, session_id, last_result)
+    do_stream_turn(
+      port,
+      parser,
+      on_message,
+      metadata,
+      session_id,
+      last_result,
+      turn_started_at,
+      stderr_path
+    )
   end
 
-  defp finalise(parser, on_message, metadata, session_id, last_result, exit_marker) do
+  # Inspect the parser's leftover (un-newlined) buffer. A single line growing
+  # past `@max_buffer_bytes` indicates a runaway tool_result; drop the partial
+  # data so we don't OOM the BEAM binary heap and surface a notice.
+  defp enforce_buffer_cap(%StreamJson{buffer: buffer} = parser, on_message, metadata, session_id) do
+    size = byte_size(buffer)
+
+    if size > @max_buffer_bytes do
+      emit_message(
+        on_message,
+        :buffer_overflow,
+        %{session_id: session_id, buffer_size: size, limit: @max_buffer_bytes},
+        metadata
+      )
+
+      %{parser | buffer: ""}
+    else
+      parser
+    end
+  end
+
+  defp finalise(parser, on_message, metadata, session_id, last_result, exit_marker, stderr_path) do
     {:ok, trailing, _parser} = StreamJson.flush(parser)
 
     last_result =
@@ -288,10 +467,18 @@ defmodule SymphonyElixir.Claude.Backend do
         process_event(event, on_message, metadata, session_id, acc)
       end)
 
+    stderr_tail = read_stderr_tail(stderr_path)
+    cleanup_stderr(stderr_path)
+
     case last_result do
-      %{status: :success} = result -> {:ok, result}
-      %{status: :failed} = result -> {:error, {:turn_failed, result}}
-      nil -> {:error, {:no_result_event, exit_marker}}
+      %{status: :success} = result ->
+        {:ok, result}
+
+      %{status: :failed} = result ->
+        {:error, {:turn_failed, Map.put(result, :stderr_tail, stderr_tail)}}
+
+      nil ->
+        {:error, {:no_result_event, exit_marker, stderr_tail}}
     end
   end
 
@@ -300,10 +487,32 @@ defmodule SymphonyElixir.Claude.Backend do
     acc
   end
 
-  defp process_event(%{} = obj, on_message, metadata, _session_id, acc) do
+  defp process_event(%{} = obj, on_message, metadata, session_id, acc) do
     case EventMapper.map_event(obj) do
       {:emit, event, payload} ->
         emit_message(on_message, event, payload, metadata)
+        acc
+
+      {:init, %{claude_session_id: claude_sid} = payload} ->
+        # Detect resume landing failure: we asked claude to resume a specific
+        # thread, but the system/init for the *first* event of the turn came
+        # back with a different session_id, meaning claude silently started a
+        # fresh conversation. Only fire on the first init we observe.
+        if acc == nil and Map.get(metadata, :is_continuation) == true and
+             is_binary(claude_sid) and claude_sid != Map.get(metadata, :requested_thread_id) do
+          emit_message(
+            on_message,
+            :resume_landing_failed,
+            %{
+              session_id: session_id,
+              requested: Map.get(metadata, :requested_thread_id),
+              actual: claude_sid
+            },
+            metadata
+          )
+        end
+
+        emit_message(on_message, :notification, Map.put(payload, :stage, :init), metadata)
         acc
 
       {:init, payload} ->
@@ -315,15 +524,77 @@ defmodule SymphonyElixir.Claude.Backend do
 
       {:result, %{status: :failed} = result} ->
         result
+
+      :ignore ->
+        acc
     end
   end
 
   defp safe_close(port) do
+    os_pid = port_os_pid(port)
+
     try do
       Port.close(port)
     catch
       :error, :badarg -> :ok
     end
+
+    # Kill the entire process group so claude's spawned node children also
+    # die. The bash wrapper uses `set -m`, making bash itself the pgid; the
+    # negative target is the standard POSIX "kill the whole pgrp" idiom.
+    if is_integer(os_pid) and os_pid > 0 do
+      _ = System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
+      Process.sleep(2_000)
+      _ = System.cmd("kill", ["-KILL", "-#{os_pid}"], stderr_to_stdout: true)
+    end
+
+    :ok
+  end
+
+  defp port_os_pid(port) do
+    try do
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} -> pid
+        _ -> nil
+      end
+    catch
+      _, _ -> nil
+    end
+  end
+
+  # --- stderr buffer helpers ------------------------------------------------
+
+  defp read_stderr_tail(nil), do: ""
+
+  defp read_stderr_tail(path) when is_binary(path) do
+    case File.stat(path) do
+      {:ok, %{size: size}} when size > 0 ->
+        offset = max(0, size - @stderr_tail_max_bytes)
+
+        case File.open(path, [:read, :binary]) do
+          {:ok, fd} ->
+            :file.position(fd, {:bof, offset})
+            chunk = IO.binread(fd, @stderr_tail_max_bytes)
+            File.close(fd)
+            normalize_stderr_chunk(chunk)
+
+          _ ->
+            ""
+        end
+
+      _ ->
+        ""
+    end
+  end
+
+  defp normalize_stderr_chunk(chunk) when is_binary(chunk), do: chunk
+  defp normalize_stderr_chunk(_), do: ""
+
+  defp cleanup_stderr(nil), do: :ok
+
+  defp cleanup_stderr(path) when is_binary(path) do
+    _ = File.rm(path)
+    :ok
   end
 
   defp trim(line) when is_binary(line) do
@@ -424,6 +695,13 @@ defmodule SymphonyElixir.Claude.Backend do
 
   defp turn_timeout_ms do
     Config.settings!().claude.turn_timeout_ms
+  end
+
+  defp stall_timeout_ms do
+    case Config.settings!().claude.stall_timeout_ms do
+      nil -> 0
+      n when is_integer(n) -> n
+    end
   end
 
   defp gen_uuid do
