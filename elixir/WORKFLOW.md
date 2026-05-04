@@ -1,4 +1,10 @@
 ---
+# ============================================================
+# DO NOT USE — runtime is /mnt/data/symphony-runtime/WORKFLOW.md
+# This file is the upstream Linear template, kept only for
+# upstream-merge reference. The live orchestrator on this host
+# (systemd --user symphony.service) loads the runtime path above.
+# ============================================================
 tracker:
   kind: linear
   project_slug: "symphony-0c79b11b75ea"
