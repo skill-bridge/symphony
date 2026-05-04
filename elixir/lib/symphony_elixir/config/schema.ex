@@ -208,7 +208,15 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:command, :string, default: "codex app-server")
 
-      field(:approval_policy, StringOrMap, default: "never")
+      field(:approval_policy, StringOrMap,
+        default: %{
+          "granular" => %{
+            "sandbox_approval" => true,
+            "rules" => true,
+            "mcp_elicitations" => true
+          }
+        }
+      )
 
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
